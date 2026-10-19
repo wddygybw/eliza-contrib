@@ -9,6 +9,8 @@ export const DEFAULT_MCP_MARKETPLACE_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_MCP_MARKETPLACE_TIMEOUT_MS = 2 * 60_000;
 const MAX_MCP_MARKETPLACE_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_MCP_MARKETPLACE_RESULTS = 50;
+/** The Registry accepts at most 100 items per page and rejects more with HTTP 422. */
+const MCP_REGISTRY_MAX_PAGE_SIZE = 100;
 
 export type McpMarketplaceErrorCode =
   | "aborted"
@@ -103,7 +105,8 @@ interface McpRegistryListResponse {
 interface ResolvedRequestOptions {
   signal: AbortSignal;
   abortKind?: "caller" | "timeout";
-  remainingResponseBytes: number;
+  /** Size limit for one Registry response. Each page gets this budget again. */
+  responseByteLimit: number;
   /** Detaches the abort listeners resolveRequestOptions() registered. */
   dispose: () => void;
 }
@@ -326,7 +329,7 @@ function resolveRequestOptions(options: McpMarketplaceRequestOptions): ResolvedR
   const controller = new AbortController();
   const resolved: ResolvedRequestOptions = {
     signal: controller.signal,
-    remainingResponseBytes: maxResponseBytes,
+    responseByteLimit: maxResponseBytes,
     dispose: () => {},
   };
   const abort = (kind: "caller" | "timeout", reason: unknown) => {
@@ -388,7 +391,7 @@ async function readBoundedJson(
   response: Response,
   options: ResolvedRequestOptions
 ): Promise<unknown> {
-  const maxResponseBytes = options.remainingResponseBytes;
+  const maxResponseBytes = options.responseByteLimit;
   const declaredBytes = Number(response.headers.get("content-length"));
   if (Number.isFinite(declaredBytes) && declaredBytes > maxResponseBytes) {
     await cancelBodyQuietly(response.body);
@@ -422,7 +425,6 @@ async function readBoundedJson(
     }
     chunks.push(value);
   }
-  options.remainingResponseBytes -= totalBytes;
 
   const body = new Uint8Array(totalBytes);
   let offset = 0;
@@ -495,18 +497,39 @@ export async function searchMcpMarketplace(
     const results: McpMarketplaceSearchItem[] = [];
     const seenNames = new Set<string>();
     const normalizedQuery = query?.toLowerCase();
-    // Query searches may need to scan several pages before the local predicate
-    // matches, so use the largest public result bound to minimize round trips.
-    const pageLimit = normalizedQuery ? MAX_MCP_MARKETPLACE_RESULTS : requestedLimit;
+    // A query searches with the local predicate, so it reads the largest page
+    // the Registry accepts. Each page is one round trip inside the single
+    // request deadline, and a larger page reaches more of the catalog in it.
+    const pageLimit = normalizedQuery ? MCP_REGISTRY_MAX_PAGE_SIZE : requestedLimit;
     let cursor: string | undefined;
     const seenCursors = new Set<string>();
 
     do {
-      const page = await fetchRegistryJson(
-        createSearchUrl(pageLimit, cursor),
-        parseListResponse,
-        resolved
-      );
+      let page: McpRegistryListResponse;
+      try {
+        page = await fetchRegistryJson(
+          createSearchUrl(pageLimit, cursor),
+          parseListResponse,
+          resolved
+        );
+      } catch (error) {
+        // The Registry `search` parameter filters names only, so a query walks
+        // the catalog page by page to also match titles and descriptions. The
+        // catalog is larger than one deadline. A deadline that expires after a
+        // page proved a match must keep that match: the entry is real, and the
+        // walk stopped before the last page, not before the first answer. An
+        // empty walk still reports the timeout, so "no match" is never claimed
+        // without a full scan.
+        if (
+          normalizedQuery &&
+          results.length > 0 &&
+          error instanceof McpMarketplaceError &&
+          error.code === "timeout"
+        ) {
+          break;
+        }
+        throw error;
+      }
       cursor = page.nextCursor;
       if (cursor && seenCursors.has(cursor)) {
         invalidResponse("MCP registry response repeated a pagination cursor");
